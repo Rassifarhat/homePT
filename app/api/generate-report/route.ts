@@ -1,9 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { openai } from "@/lib/openai";
 import { ReportSchema } from "@/lib/schema";
-import { generatePdf } from "@/lib/generatePdf";
-import fs from "fs/promises";
-import path from "path";
 
 const SYSTEM_PROMPT = `You are an assistant that writes professional orthopedic medical reports as structured data.
 
@@ -32,8 +29,9 @@ DETAILED RULES:
 2. clinicalHistory (string)
    - One or more paragraphs describing:
      - Symptoms, onset, duration, functional limitations, aggravating/relieving factors.
-   - MUST include pain score > 8/10 (e.g. 9/10).
-   - Example phrasing: "The patient reports severe right knee pain with intensity 9/10..."
+   - Extract the EXACT pain score from the clinical documents/images provided (e.g., if the document states 6/10, use 6/10).
+   - Use descriptive qualifiers that match the pain level (e.g., "mild" for 1-3/10, "moderate" for 4-6/10, "severe" for 7-9/10, "unbearable" for 10/10).
+   - Example phrasing: "The patient reports severe right knee pain with intensity 8/10..." (adjust intensity based on actual documented pain score).
    - No bullet points; this is narrative text.
 
 3. pastMedicalHistory (string[])
@@ -75,8 +73,9 @@ DETAILED RULES:
 7. treatmentPlan (object)
    - medications (string[])
      - MUST ALWAYS include:
-       - "Diclofenac gel topical, as needed, unless contraindicated."
-       - "Paracetamol 650 mg, as needed for pain, unless contraindicated."
+       - "Diclofenac gel topical"
+       - "Paracetamol 650 mg"
+     - Format: medication name and dosage ONLY, with no additional comments, qualifiers, or contraindication notes.
    - homePhysio (object)
      - frequency: MUST ALWAYS be "3 times per week".
      - duration: MUST ALWAYS be "6 months".
@@ -113,7 +112,7 @@ DETAILED RULES:
 GENERAL RULES:
 - Use formal medical English.
 - Do not address the patient directly; describe in third person.
-- Ensure pain score > 8/10 is consistent across clinicalHistory and clinicalNotes.
+- Ensure the pain score extracted from the clinical documents is consistent across clinicalHistory and clinicalNotes.
 - Ensure homePhysio.frequency and homePhysio.duration exactly match:
   - "3 times per week"
   - "6 months"
@@ -326,31 +325,9 @@ export async function POST(request: NextRequest) {
     const reportData = JSON.parse(reportText);
     const validatedReport = ReportSchema.parse(reportData);
 
-    // Generate PDF from the validated report
-    const pdfBytes = await generatePdf(validatedReport);
-
-    // Create reports directory if it doesn't exist
-    const reportsDir = path.join(process.cwd(), "reports");
-    await fs.mkdir(reportsDir, { recursive: true });
-
-    // Generate filename with timestamp and patient name
-    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const patientName = validatedReport.patientInformation.name
-      .replace(/[^a-zA-Z0-9]/g, "_")
-      .substring(0, 30);
-    const filename = `${patientName}_${timestamp}.pdf`;
-    const filepath = path.join(reportsDir, filename);
-
-    // Save PDF to file system
-    await fs.writeFile(filepath, pdfBytes);
-
-    console.log(`PDF saved to: ${filepath}`);
-
     return NextResponse.json({
       success: true,
       report: validatedReport,
-      pdfPath: filepath,
-      pdfFilename: filename,
     });
 
   } catch (error: any) {
