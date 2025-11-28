@@ -40,16 +40,13 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const extractedPatients = [];
-
-    // Process each image to extract patient info
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i];
+    // Process all images in parallel for much faster extraction
+    const extractionPromises = files.map(async (file, i) => {
       const imageDataUrl = await fileToBase64DataUrl(file);
 
       try {
         const response = await openai.chat.completions.create({
-          model: "gpt-4o",
+          model: "gpt-4o-mini",
           messages: [
             {
               role: "user",
@@ -95,16 +92,16 @@ export async function POST(request: NextRequest) {
 
         const patientInfo = JSON.parse(content);
 
-        extractedPatients.push({
+        return {
           id: `patient-${i}-${Date.now()}`,
           ...patientInfo,
-          hospital: "Emirates International Hospital", // Always constant
+          hospital: "Emirates International Hospital",
           imageIndex: i,
-        });
+        };
 
       } catch (err: any) {
         // If extraction fails for one image, include error info
-        extractedPatients.push({
+        return {
           id: `patient-${i}-${Date.now()}`,
           name: `Patient ${i + 1} (Extraction Failed)`,
           dateOfBirth: "Unknown",
@@ -114,9 +111,11 @@ export async function POST(request: NextRequest) {
           hospital: "Emirates International Hospital",
           imageIndex: i,
           extractionError: err.message,
-        });
+        };
       }
-    }
+    });
+
+    const extractedPatients = await Promise.all(extractionPromises);
 
     return NextResponse.json({
       success: true,

@@ -1,4 +1,4 @@
-import { PDFDocument, rgb, StandardFonts } from "pdf-lib";
+import { PDFDocument, PDFPage, PDFFont, rgb, StandardFonts } from "pdf-lib";
 import type { ReportData } from "./schema";
 
 interface TextConfig {
@@ -6,16 +6,22 @@ interface TextConfig {
   x: number;
   y: number;
   size: number;
-  font: any;
+  font: PDFFont;
   maxWidth?: number;
   lineHeight?: number;
-  isBold?: boolean;
+}
+
+interface PageContext {
+  pdfDoc: PDFDocument;
+  pageHeight: number;
+  topPadding: number;
+  bottomPadding: number;
 }
 
 function wrapText(
   text: string,
   maxWidth: number,
-  font: any,
+  font: PDFFont,
   fontSize: number
 ): string[] {
   const words = text.split(" ");
@@ -41,7 +47,11 @@ function wrapText(
   return lines;
 }
 
-function drawText(page: any, config: TextConfig): number {
+function drawText(
+  page: PDFPage,
+  config: TextConfig,
+  ctx: PageContext
+): { yPosition: number; page: PDFPage } {
   const {
     text,
     x,
@@ -54,9 +64,16 @@ function drawText(page: any, config: TextConfig): number {
 
   const lines = wrapText(text, maxWidth, font, size);
   let currentY = y;
+  let currentPage = page;
 
   for (const line of lines) {
-    page.drawText(line, {
+    // Check if this line will fit on the current page
+    if (currentY < ctx.bottomPadding) {
+      currentPage = ctx.pdfDoc.addPage([595, 842]);
+      currentY = ctx.pageHeight - ctx.topPadding;
+    }
+
+    currentPage.drawText(line, {
       x,
       y: currentY,
       size,
@@ -66,7 +83,20 @@ function drawText(page: any, config: TextConfig): number {
     currentY -= lineHeight;
   }
 
-  return currentY;
+  return { yPosition: currentY, page: currentPage };
+}
+
+function ensureSpaceForSection(
+  currentPage: PDFPage,
+  yPosition: number,
+  minSpace: number,
+  ctx: PageContext
+): { yPosition: number; page: PDFPage } {
+  if (yPosition - minSpace < ctx.bottomPadding) {
+    const newPage = ctx.pdfDoc.addPage([595, 842]);
+    return { yPosition: ctx.pageHeight - ctx.topPadding, page: newPage };
+  }
+  return { yPosition, page: currentPage };
 }
 
 export async function generatePdf(report: ReportData): Promise<Uint8Array> {
@@ -83,7 +113,14 @@ export async function generatePdf(report: ReportData): Promise<Uint8Array> {
   const margin = 50;
   const maxWidth = pageWidth - 2 * margin;
 
-  let yPosition = pageHeight - topPadding; // Top padding of 180
+  // Minimum space requirements for section headers (header + 2 lines of content)
+  const MAJOR_SECTION_MIN_SPACE = 74; // 14pt header + 24pt spacing + 2×18pt lines
+  const SUBSECTION_MIN_SPACE = 66; // 12pt header + 18pt spacing + 2×18pt lines
+
+  // Page context for helper functions
+  const ctx: PageContext = { pdfDoc, pageHeight, topPadding, bottomPadding };
+
+  let yPosition = pageHeight - topPadding;
 
   // Title: "Medical Report" - centered, bold, 20pt (only on first page)
   const titleText = "Medical Report";
@@ -98,16 +135,8 @@ export async function generatePdf(report: ReportData): Promise<Uint8Array> {
 
   yPosition -= 40; // Space after title
 
-  const checkNewPage = () => {
-    if (yPosition < bottomPadding) {
-      // Bottom padding of 80
-      page = pdfDoc.addPage([595, 842]);
-      yPosition = pageHeight - topPadding; // Top padding of 180 for each new page
-    }
-  };
-
   // Patient Information Section
-  checkNewPage();
+  ({ yPosition, page } = ensureSpaceForSection(page, yPosition, MAJOR_SECTION_MIN_SPACE, ctx));
   page.drawText("Patient Information:", {
     x: margin,
     y: yPosition,
@@ -128,8 +157,7 @@ export async function generatePdf(report: ReportData): Promise<Uint8Array> {
   ];
 
   for (const field of patientFields) {
-    checkNewPage();
-    yPosition = drawText(page, {
+    ({ yPosition, page } = drawText(page, {
       text: field,
       x: margin,
       y: yPosition,
@@ -137,13 +165,13 @@ export async function generatePdf(report: ReportData): Promise<Uint8Array> {
       font: regularFont,
       maxWidth,
       lineHeight: 18,
-    });
+    }, ctx));
   }
 
   yPosition -= 12; // Single blank line
 
   // Clinical History Section
-  checkNewPage();
+  ({ yPosition, page } = ensureSpaceForSection(page, yPosition, MAJOR_SECTION_MIN_SPACE, ctx));
   page.drawText("Clinical History:", {
     x: margin,
     y: yPosition,
@@ -153,8 +181,7 @@ export async function generatePdf(report: ReportData): Promise<Uint8Array> {
   });
   yPosition -= 24;
 
-  checkNewPage();
-  yPosition = drawText(page, {
+  ({ yPosition, page } = drawText(page, {
     text: report.clinicalHistory,
     x: margin,
     y: yPosition,
@@ -162,12 +189,12 @@ export async function generatePdf(report: ReportData): Promise<Uint8Array> {
     font: regularFont,
     maxWidth,
     lineHeight: 18,
-  });
+  }, ctx));
 
   yPosition -= 12;
 
   // Past Medical History Section
-  checkNewPage();
+  ({ yPosition, page } = ensureSpaceForSection(page, yPosition, MAJOR_SECTION_MIN_SPACE, ctx));
   page.drawText("Past Medical History:", {
     x: margin,
     y: yPosition,
@@ -178,8 +205,7 @@ export async function generatePdf(report: ReportData): Promise<Uint8Array> {
   yPosition -= 24;
 
   for (const item of report.pastMedicalHistory) {
-    checkNewPage();
-    yPosition = drawText(page, {
+    ({ yPosition, page } = drawText(page, {
       text: `• ${item}`,
       x: margin,
       y: yPosition,
@@ -187,13 +213,13 @@ export async function generatePdf(report: ReportData): Promise<Uint8Array> {
       font: regularFont,
       maxWidth,
       lineHeight: 18,
-    });
+    }, ctx));
   }
 
   yPosition -= 12;
 
   // Vital Signs Section
-  checkNewPage();
+  ({ yPosition, page } = ensureSpaceForSection(page, yPosition, MAJOR_SECTION_MIN_SPACE, ctx));
   page.drawText("Vital Signs:", {
     x: margin,
     y: yPosition,
@@ -204,8 +230,7 @@ export async function generatePdf(report: ReportData): Promise<Uint8Array> {
   yPosition -= 24;
 
   for (const item of report.vitalSigns) {
-    checkNewPage();
-    yPosition = drawText(page, {
+    ({ yPosition, page } = drawText(page, {
       text: `• ${item}`,
       x: margin,
       y: yPosition,
@@ -213,13 +238,13 @@ export async function generatePdf(report: ReportData): Promise<Uint8Array> {
       font: regularFont,
       maxWidth,
       lineHeight: 18,
-    });
+    }, ctx));
   }
 
   yPosition -= 12;
 
   // Clinical Notes Section
-  checkNewPage();
+  ({ yPosition, page } = ensureSpaceForSection(page, yPosition, MAJOR_SECTION_MIN_SPACE, ctx));
   page.drawText("Clinical Notes:", {
     x: margin,
     y: yPosition,
@@ -229,8 +254,7 @@ export async function generatePdf(report: ReportData): Promise<Uint8Array> {
   });
   yPosition -= 24;
 
-  checkNewPage();
-  yPosition = drawText(page, {
+  ({ yPosition, page } = drawText(page, {
     text: report.clinicalNotes,
     x: margin,
     y: yPosition,
@@ -238,12 +262,12 @@ export async function generatePdf(report: ReportData): Promise<Uint8Array> {
     font: regularFont,
     maxWidth,
     lineHeight: 18,
-  });
+  }, ctx));
 
   yPosition -= 12;
 
   // Diagnoses Section
-  checkNewPage();
+  ({ yPosition, page } = ensureSpaceForSection(page, yPosition, MAJOR_SECTION_MIN_SPACE, ctx));
   page.drawText("Diagnoses:", {
     x: margin,
     y: yPosition,
@@ -254,8 +278,7 @@ export async function generatePdf(report: ReportData): Promise<Uint8Array> {
   yPosition -= 24;
 
   for (const diagnosis of report.diagnoses) {
-    checkNewPage();
-    yPosition = drawText(page, {
+    ({ yPosition, page } = drawText(page, {
       text: `• ${diagnosis.label} (${diagnosis.code}): ${diagnosis.description}`,
       x: margin,
       y: yPosition,
@@ -263,13 +286,13 @@ export async function generatePdf(report: ReportData): Promise<Uint8Array> {
       font: regularFont,
       maxWidth,
       lineHeight: 18,
-    });
+    }, ctx));
   }
 
   yPosition -= 12;
 
   // Treatment Plan Section
-  checkNewPage();
+  ({ yPosition, page } = ensureSpaceForSection(page, yPosition, MAJOR_SECTION_MIN_SPACE, ctx));
   page.drawText("Treatment Plan:", {
     x: margin,
     y: yPosition,
@@ -280,7 +303,7 @@ export async function generatePdf(report: ReportData): Promise<Uint8Array> {
   yPosition -= 24;
 
   // Medications
-  checkNewPage();
+  ({ yPosition, page } = ensureSpaceForSection(page, yPosition, SUBSECTION_MIN_SPACE, ctx));
   page.drawText("Medications:", {
     x: margin,
     y: yPosition,
@@ -291,8 +314,7 @@ export async function generatePdf(report: ReportData): Promise<Uint8Array> {
   yPosition -= 18;
 
   for (const med of report.treatmentPlan.medications) {
-    checkNewPage();
-    yPosition = drawText(page, {
+    ({ yPosition, page } = drawText(page, {
       text: `• ${med}`,
       x: margin,
       y: yPosition,
@@ -300,13 +322,13 @@ export async function generatePdf(report: ReportData): Promise<Uint8Array> {
       font: regularFont,
       maxWidth,
       lineHeight: 18,
-    });
+    }, ctx));
   }
 
   yPosition -= 12;
 
   // Home Physiotherapy
-  checkNewPage();
+  ({ yPosition, page } = ensureSpaceForSection(page, yPosition, SUBSECTION_MIN_SPACE, ctx));
   page.drawText("Home Physiotherapy:", {
     x: margin,
     y: yPosition,
@@ -316,8 +338,7 @@ export async function generatePdf(report: ReportData): Promise<Uint8Array> {
   });
   yPosition -= 18;
 
-  checkNewPage();
-  yPosition = drawText(page, {
+  ({ yPosition, page } = drawText(page, {
     text: `Frequency: ${report.treatmentPlan.homePhysio.frequency}`,
     x: margin,
     y: yPosition,
@@ -325,10 +346,9 @@ export async function generatePdf(report: ReportData): Promise<Uint8Array> {
     font: regularFont,
     maxWidth,
     lineHeight: 18,
-  });
+  }, ctx));
 
-  checkNewPage();
-  yPosition = drawText(page, {
+  ({ yPosition, page } = drawText(page, {
     text: `Duration: ${report.treatmentPlan.homePhysio.duration}`,
     x: margin,
     y: yPosition,
@@ -336,12 +356,12 @@ export async function generatePdf(report: ReportData): Promise<Uint8Array> {
     font: regularFont,
     maxWidth,
     lineHeight: 18,
-  });
+  }, ctx));
 
   yPosition -= 12;
 
   // Short-Term Goals
-  checkNewPage();
+  ({ yPosition, page } = ensureSpaceForSection(page, yPosition, SUBSECTION_MIN_SPACE, ctx));
   page.drawText("Short-Term Goals:", {
     x: margin,
     y: yPosition,
@@ -352,8 +372,7 @@ export async function generatePdf(report: ReportData): Promise<Uint8Array> {
   yPosition -= 18;
 
   for (const goal of report.treatmentPlan.shortTermGoals) {
-    checkNewPage();
-    yPosition = drawText(page, {
+    ({ yPosition, page } = drawText(page, {
       text: `• ${goal}`,
       x: margin,
       y: yPosition,
@@ -361,13 +380,13 @@ export async function generatePdf(report: ReportData): Promise<Uint8Array> {
       font: regularFont,
       maxWidth,
       lineHeight: 18,
-    });
+    }, ctx));
   }
 
   yPosition -= 12;
 
   // Long-Term Goals
-  checkNewPage();
+  ({ yPosition, page } = ensureSpaceForSection(page, yPosition, SUBSECTION_MIN_SPACE, ctx));
   page.drawText("Long-Term Goals:", {
     x: margin,
     y: yPosition,
@@ -378,8 +397,7 @@ export async function generatePdf(report: ReportData): Promise<Uint8Array> {
   yPosition -= 18;
 
   for (const goal of report.treatmentPlan.longTermGoals) {
-    checkNewPage();
-    yPosition = drawText(page, {
+    ({ yPosition, page } = drawText(page, {
       text: `• ${goal}`,
       x: margin,
       y: yPosition,
@@ -387,13 +405,13 @@ export async function generatePdf(report: ReportData): Promise<Uint8Array> {
       font: regularFont,
       maxWidth,
       lineHeight: 18,
-    });
+    }, ctx));
   }
 
   yPosition -= 12;
 
   // Prognosis Section
-  checkNewPage();
+  ({ yPosition, page } = ensureSpaceForSection(page, yPosition, MAJOR_SECTION_MIN_SPACE, ctx));
   page.drawText("Prognosis:", {
     x: margin,
     y: yPosition,
@@ -404,8 +422,7 @@ export async function generatePdf(report: ReportData): Promise<Uint8Array> {
   yPosition -= 24;
 
   for (const item of report.prognosis) {
-    checkNewPage();
-    yPosition = drawText(page, {
+    ({ yPosition, page } = drawText(page, {
       text: `• ${item}`,
       x: margin,
       y: yPosition,
@@ -413,13 +430,13 @@ export async function generatePdf(report: ReportData): Promise<Uint8Array> {
       font: regularFont,
       maxWidth,
       lineHeight: 18,
-    });
+    }, ctx));
   }
 
   yPosition -= 12;
 
   // Conclusion Section
-  checkNewPage();
+  ({ yPosition, page } = ensureSpaceForSection(page, yPosition, MAJOR_SECTION_MIN_SPACE, ctx));
   page.drawText("Conclusion:", {
     x: margin,
     y: yPosition,
@@ -429,8 +446,7 @@ export async function generatePdf(report: ReportData): Promise<Uint8Array> {
   });
   yPosition -= 24;
 
-  checkNewPage();
-  yPosition = drawText(page, {
+  ({ yPosition, page } = drawText(page, {
     text: report.conclusion,
     x: margin,
     y: yPosition,
@@ -438,12 +454,12 @@ export async function generatePdf(report: ReportData): Promise<Uint8Array> {
     font: regularFont,
     maxWidth,
     lineHeight: 18,
-  });
+  }, ctx));
 
   yPosition -= 24; // Space before signature
 
-  // Signature Section
-  checkNewPage();
+  // Signature Section - ensure enough space for entire signature block (~150pt)
+  ({ yPosition, page } = ensureSpaceForSection(page, yPosition, 150, ctx));
   page.drawText(report.signature.greeting, {
     x: margin,
     y: yPosition,
@@ -453,7 +469,6 @@ export async function generatePdf(report: ReportData): Promise<Uint8Array> {
   });
   yPosition -= 24;
 
-  checkNewPage();
   page.drawText(report.signature.doctorName, {
     x: margin,
     y: yPosition,
@@ -463,7 +478,6 @@ export async function generatePdf(report: ReportData): Promise<Uint8Array> {
   });
   yPosition -= 18;
 
-  checkNewPage();
   page.drawText(report.signature.title, {
     x: margin,
     y: yPosition,
@@ -473,7 +487,6 @@ export async function generatePdf(report: ReportData): Promise<Uint8Array> {
   });
   yPosition -= 18;
 
-  checkNewPage();
   page.drawText(report.signature.dohLicense, {
     x: margin,
     y: yPosition,
@@ -483,7 +496,6 @@ export async function generatePdf(report: ReportData): Promise<Uint8Array> {
   });
   yPosition -= 18;
 
-  checkNewPage();
   page.drawText(report.signature.facility, {
     x: margin,
     y: yPosition,
@@ -493,7 +505,6 @@ export async function generatePdf(report: ReportData): Promise<Uint8Array> {
   });
   yPosition -= 18;
 
-  checkNewPage();
   page.drawText(report.signature.date, {
     x: margin,
     y: yPosition,
@@ -503,7 +514,6 @@ export async function generatePdf(report: ReportData): Promise<Uint8Array> {
   });
   yPosition -= 24;
 
-  checkNewPage();
   page.drawText(report.signature.signatureStamp, {
     x: margin,
     y: yPosition,
