@@ -1,7 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
-import { ReportSchema } from "@/lib/schema";
+import { ReportSchema, FTFFormSchema } from "@/lib/schema";
 import { generatePdf } from "@/lib/generatePdf";
 import { generateDocx } from "@/lib/generateDocx";
+import { fillFtfPdf } from "@/lib/fillFtfPdf";
+import { generateSummaryPdf } from "@/lib/generateSummaryPdf";
 import fs from "fs/promises";
 import path from "path";
 
@@ -11,7 +13,11 @@ export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
     const { reports, batchTimestamp } = body as {
-      reports: Array<{ patientId: string; report: any }>;
+      reports: Array<{
+        patientId: string;
+        report: any;
+        ftfFormData: any;
+      }>;
       batchTimestamp: string;
     };
 
@@ -44,12 +50,16 @@ export async function POST(request: NextRequest) {
       pdfFilename: string;
       docxPath?: string;
       docxFilename?: string;
+      ftfPdfPath?: string;
+      ftfPdfFilename?: string;
+      summaryPdfPath?: string;
+      summaryPdfFilename?: string;
       status: "success" | "error";
       error?: string;
     }> = [];
 
     // Process reports serially
-    for (const { patientId, report } of reports) {
+    for (const { patientId, report, ftfFormData } of reports) {
       try {
         // Validate the report with Zod
         const validatedReport = ReportSchema.parse(report);
@@ -79,6 +89,50 @@ export async function POST(request: NextRequest) {
         console.log(`PDF saved: ${pdfFilepath}`);
         console.log(`DOCX saved: ${docxFilepath}`);
 
+        // Generate and save FTF PDF if ftfFormData is provided
+        let ftfPdfFilepath: string | undefined;
+        let ftfPdfFilename: string | undefined;
+
+        if (ftfFormData) {
+          try {
+            // Validate FTF form data
+            const validatedFtfData = FTFFormSchema.parse(ftfFormData);
+
+            // Generate FTF PDF
+            const ftfPdfBytes = await fillFtfPdf(validatedFtfData);
+
+            // Create FTF PDF filename
+            ftfPdfFilename = `${patientName}_${batchTimestamp}_FTF.pdf`;
+            ftfPdfFilepath = path.join(reportsDir, ftfPdfFilename);
+
+            // Save FTF PDF
+            await fs.writeFile(ftfPdfFilepath, ftfPdfBytes);
+
+            console.log(`FTF PDF saved: ${ftfPdfFilepath}`);
+          } catch (ftfError: any) {
+            console.error(`Error creating FTF PDF for patient ${patientId}:`, ftfError);
+            // Continue without FTF PDF - don't fail the entire process
+          }
+        }
+
+        // Generate Summary PDF (ICD-10, History, Plan with Home PT Referral)
+        let summaryPdfFilepath: string | undefined;
+        let summaryPdfFilename: string | undefined;
+
+        try {
+          const summaryPdfBytes = await generateSummaryPdf(validatedReport);
+
+          summaryPdfFilename = `${patientName}_${batchTimestamp}_Summary.pdf`;
+          summaryPdfFilepath = path.join(reportsDir, summaryPdfFilename);
+
+          await fs.writeFile(summaryPdfFilepath, summaryPdfBytes);
+
+          console.log(`Summary PDF saved: ${summaryPdfFilepath}`);
+        } catch (summaryError: any) {
+          console.error(`Error creating Summary PDF for patient ${patientId}:`, summaryError);
+          // Continue without Summary PDF - don't fail the entire process
+        }
+
         results.push({
           patientId,
           patientName: validatedReport.patientInformation.name,
@@ -86,6 +140,10 @@ export async function POST(request: NextRequest) {
           pdfFilename: pdfFilename,
           docxPath: docxFilepath,
           docxFilename: docxFilename,
+          ftfPdfPath: ftfPdfFilepath,
+          ftfPdfFilename: ftfPdfFilename,
+          summaryPdfPath: summaryPdfFilepath,
+          summaryPdfFilename: summaryPdfFilename,
           status: "success",
         });
 

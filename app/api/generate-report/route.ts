@@ -27,6 +27,11 @@ DETAILED RULES:
    - If some field is not readable, use a reasonable placeholder and keep it clearly generic (e.g. "Unknown").
 
 2. clinicalHistory (string)
+     - MANDATORY HOMEBOUND STATUS .
+      - You MUST include at least one sentence about the patient's homebound status.
+       if the clinical data does not support homebound status, use a social description 
+       of the patient's homebound status like the patient leaves home only for medical appointments
+        or emergency or religious reasons.
    - One or more paragraphs describing:
      - Symptoms, onset, duration, functional limitations, aggravating/relieving factors.
    - Extract the EXACT pain score from the clinical documents/images provided (e.g., if the document states 6/10, use 6/10).
@@ -69,6 +74,19 @@ DETAILED RULES:
      - "code": appropriate ICD-10 code.
      - "description": a short description.
    - Use best reasonable ICD-10 codes based on the case.
+    - MANDATORY HOMEBOUND STATUS (Per Daman Circular PND/AA/ME/25/UAE-75):
+      - You MUST include at least one ICD-10 code describing the patient's homebound status.
+      - Select the most appropriate code(s) from this list to add to the diagnoses array:
+        - "Z74.01": Bed confinement status (if bedbound)
+        - "Z74.09": Other reduced mobility (general reduced mobility)
+        - "Z74.2": Need for assistance at home and no other household member able to render care
+        - "Z74.3": Need for continuous supervision
+        - "Z47.32": Aftercare following explantation of hip joint prosthesis
+        - "Z48.811": Encounter for surgical aftercare following surgery on the nervous system
+        - "Z48.812": Encounter for surgical aftercare following surgery on the circulatory system
+      - Failure to include one of these status codes will result in claim rejection.
+    - COMORBIDITIES:
+      - Include all relevant comorbidities contributing to the patient's condition in this diagnoses list with their appropriate ICD-10 codes.
 
 7. treatmentPlan (object)
    - medications (string[])

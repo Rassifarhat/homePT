@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { openai } from "@/lib/openai";
-import { ReportSchema } from "@/lib/schema";
+import { CombinedResponseSchema } from "@/lib/schema";
 
 const SYSTEM_PROMPT = `You are an assistant that writes professional orthopedic medical reports as structured data.
 
@@ -119,7 +119,41 @@ GENERAL RULES:
 
 OUTPUT FORMAT:
 - Return ONLY a valid JSON object matching the schema above.
-- No explanations, no backticks, no extra text before or after the JSON.`;
+- No explanations, no backticks, no extra text before or after the JSON.
+
+ADDITIONALLY, you must generate data for the DOH Home Healthcare Referral Form (FTF form):
+
+FTF FORM DATA RULES:
+11. ftfFormData (object)
+   - name: Use exact patient name from patientInformation
+   - date: Convert dateOfReport from YYYY-MM-DD format to DD/MM/YYYY format
+     Example: "2024-11-25" becomes "25/11/2024"
+   - homebound_check: Always "on"
+   - reason_homebound_check: Always "on"
+   - reason_1: Extract primary pain points and symptoms from clinicalHistory and diagnoses
+     Format: Brief 1-2 sentence statement of main orthopedic complaints
+     Example: "Severe bilateral knee osteoarthritis causing significant pain and limiting mobility."
+   - findings_1: Explain why patient cannot leave home based on clinicalNotes
+     Format: 2-3 sentence statement on mobility limitations, ROM restrictions, weakness that confine patient to home
+     Example: "Patient demonstrates severe ROM restriction with knee flexion limited to 90 degrees bilaterally and extension deficit of -10 degrees. Muscle strength is reduced to 3/5 in bilateral lower extremities. Ambulation is severely compromised requiring assistive device and causing taxing effort, rendering patient homebound."
+   - reason_2: MUST BE IDENTICAL to reason_1
+   - findings_2: MUST BE IDENTICAL to findings_1
+   - risk_factors: List from pastMedicalHistory as comma-separated string
+     If no past medical history: "None reported"
+     Example: "Hypertension, Type 2 diabetes, Osteoporosis"
+   - session_week_1: Always "3/week"
+   - session_week_1_check: Always "on"
+   - session_week_2: Always "3/week"
+   - duration_pt: Always "6 months"
+   - treatment_details: Summarize shortTermGoals and longTermGoals in 2-3 sentences
+     Format: "Short-term goals (4-8 weeks): [summary]. Long-term goals (6 months): [summary]."
+     Example: "Short-term goals (4-8 weeks): Reduce pain intensity, improve knee ROM to 110 degrees flexion, improve transfers and bed mobility. Long-term goals (6 months): Achieve independent ambulation with assistive device, improve lower extremity strength to 4/5, reduce reliance on pain medications, improve ADL independence."
+
+CRITICAL: The response must contain TWO top-level objects:
+1. medicalReport - containing all the medical report data as described in rules 1-10
+2. ftfFormData - containing all the FTF form data as described in rule 11
+
+Both must be included in a single JSON response with these exact keys.`;
 
 interface PatientInfo {
   id: string;
@@ -131,14 +165,34 @@ interface PatientInfo {
   hospital: string;
 }
 
+interface ClinicalFile {
+  base64: string;
+  type: "image" | "pdf";
+  filename: string;
+  mimeType: string;
+}
+
 interface PatientData {
   patientInfo: PatientInfo;
   clinicalText: string;
-  clinicalImageBase64?: string;
+  clinicalFiles?: ClinicalFile[];
 }
 
 async function generateSingleReport(patientData: PatientData) {
-  const { patientInfo, clinicalText, clinicalImageBase64 } = patientData;
+  const { patientInfo, clinicalText, clinicalFiles } = patientData;
+
+  // Validate total file size if files are present
+  if (clinicalFiles && clinicalFiles.length > 0) {
+    let totalSize = 0;
+    for (const file of clinicalFiles) {
+      // Estimate file size from base64 (base64 is ~1.37x original)
+      const estimatedSize = (file.base64.length * 0.75) / (1024 * 1024); // MB
+      totalSize += estimatedSize;
+    }
+    if (totalSize > 30) {
+      throw new Error(`Total file size too large (${totalSize.toFixed(1)}MB). Maximum is 30MB.`);
+    }
+  }
 
   // Build user content
   const userContent: Array<any> = [];
@@ -163,18 +217,38 @@ Hospital: ${patientInfo.hospital}`,
     });
   }
 
-  // Add clinical image if provided
-  if (clinicalImageBase64) {
-    userContent.push({
-      type: "image_url",
-      image_url: {
-        url: clinicalImageBase64,
-      },
-    });
-    userContent.push({
-      type: "text",
-      text: "The above image contains clinical notes or findings.",
-    });
+  // Add clinical files (images and PDFs) if provided
+  if (clinicalFiles && clinicalFiles.length > 0) {
+    for (const file of clinicalFiles) {
+      if (file.type === "pdf") {
+        // For PDFs, use the new "file" content type (OpenAI March 2025 format)
+        userContent.push({
+          type: "file",
+          file: {
+            file_data: `data:application/pdf;base64,${file.base64}`,
+            filename: file.filename,
+          },
+        });
+
+        userContent.push({
+          type: "text",
+          text: `The above PDF document "${file.filename}" contains clinical notes, findings, or medical records. Please extract all relevant clinical information from all pages.`,
+        });
+      } else {
+        // For images, use image_url content type
+        userContent.push({
+          type: "image_url",
+          image_url: {
+            url: `data:${file.mimeType};base64,${file.base64}`,
+          },
+        });
+
+        userContent.push({
+          type: "text",
+          text: `The above image "${file.filename}" contains clinical notes or findings.`,
+        });
+      }
+    }
   }
 
   const response = await openai.chat.completions.create({
@@ -192,12 +266,15 @@ Hospital: ${patientInfo.hospital}`,
     response_format: {
       type: "json_schema",
       json_schema: {
-        name: "thiqa_medical_report",
+        name: "combined_medical_and_ftf_data",
         strict: true,
         schema: {
           type: "object",
           properties: {
-            patientInformation: {
+            medicalReport: {
+              type: "object",
+              properties: {
+                patientInformation: {
               type: "object",
               properties: {
                 name: { type: "string" },
@@ -281,33 +358,73 @@ Hospital: ${patientInfo.hospital}`,
               additionalProperties: false,
             },
           },
-          required: [
-            "patientInformation",
-            "clinicalHistory",
-            "pastMedicalHistory",
-            "vitalSigns",
-            "clinicalNotes",
-            "diagnoses",
-            "treatmentPlan",
-            "prognosis",
-            "conclusion",
-            "signature",
-          ],
-          additionalProperties: false,
+                required: [
+                  "patientInformation",
+                  "clinicalHistory",
+                  "pastMedicalHistory",
+                  "vitalSigns",
+                  "clinicalNotes",
+                  "diagnoses",
+                  "treatmentPlan",
+                  "prognosis",
+                  "conclusion",
+                  "signature",
+                ],
+                additionalProperties: false,
+              },
+              ftfFormData: {
+                type: "object",
+                properties: {
+                  name: { type: "string" },
+                  date: { type: "string" },
+                  homebound_check: { type: "string", enum: ["on"] },
+                  reason_homebound_check: { type: "string", enum: ["on"] },
+                  reason_1: { type: "string" },
+                  findings_1: { type: "string" },
+                  reason_2: { type: "string" },
+                  findings_2: { type: "string" },
+                  risk_factors: { type: "string" },
+                  session_week_1: { type: "string", enum: ["3/week"] },
+                  session_week_1_check: { type: "string", enum: ["on"] },
+                  session_week_2: { type: "string", enum: ["3/week"] },
+                  duration_pt: { type: "string", enum: ["6 months"] },
+                  treatment_details: { type: "string" },
+                },
+                required: [
+                  "name",
+                  "date",
+                  "homebound_check",
+                  "reason_homebound_check",
+                  "reason_1",
+                  "findings_1",
+                  "reason_2",
+                  "findings_2",
+                  "risk_factors",
+                  "session_week_1",
+                  "session_week_1_check",
+                  "session_week_2",
+                  "duration_pt",
+                  "treatment_details",
+                ],
+                additionalProperties: false,
+              },
+            },
+            required: ["medicalReport", "ftfFormData"],
+            additionalProperties: false,
+          },
         },
       },
-    },
-  });
+    });
 
   const reportText = response.choices[0]?.message?.content;
   if (!reportText) {
     throw new Error("No response from OpenAI");
   }
 
-  const reportData = JSON.parse(reportText);
-  const validatedReport = ReportSchema.parse(reportData);
+  const combinedData = JSON.parse(reportText);
+  const validatedData = CombinedResponseSchema.parse(combinedData);
 
-  return validatedReport;
+  return validatedData;
 }
 
 export async function POST(request: NextRequest) {
@@ -337,11 +454,11 @@ export async function POST(request: NextRequest) {
       const chunkResults = await Promise.all(
         chunk.map(async (patientData) => {
           try {
-            const report = await generateSingleReport(patientData);
+            const combinedData = await generateSingleReport(patientData);
             return {
               patientId: patientData.patientInfo.id,
               patientName: patientData.patientInfo.name,
-              report,
+              report: combinedData, // Now includes both medicalReport and ftfFormData
               status: "success" as const,
             };
           } catch (err: any) {

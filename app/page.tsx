@@ -16,7 +16,7 @@ interface PatientInfo {
 
 interface PatientWithClinicalData extends PatientInfo {
   clinicalText: string;
-  clinicalImage: File | null;
+  clinicalFiles: File[];
 }
 
 interface ReportResult {
@@ -35,11 +35,38 @@ interface PdfResult {
   pdfFilename: string;
   docxPath?: string;
   docxFilename?: string;
+  ftfPdfPath?: string;
+  ftfPdfFilename?: string;
   status: "success" | "error";
   error?: string;
 }
 
 type WorkflowStep = "upload" | "clinical-data" | "review" | "pdf-results";
+
+const MAX_FILE_SIZE = 30 * 1024 * 1024; // 30MB (buffer below OpenAI 32MB limit)
+
+function validateClinicalFile(file: File): { valid: boolean; error?: string } {
+  // Check file size
+  if (file.size > MAX_FILE_SIZE) {
+    return {
+      valid: false,
+      error: `File too large. Maximum size is ${MAX_FILE_SIZE / (1024 * 1024)}MB.`,
+    };
+  }
+
+  // Check file type - allow images and PDFs
+  const isPdf = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
+  const isImage = file.type.startsWith('image/');
+
+  if (!isPdf && !isImage) {
+    return {
+      valid: false,
+      error: 'Invalid file type. Please upload an image (JPEG, PNG, GIF, WebP) or PDF.',
+    };
+  }
+
+  return { valid: true };
+}
 
 export default function Home() {
   // Workflow state
@@ -92,7 +119,7 @@ export default function Home() {
         (p: PatientInfo) => ({
           ...p,
           clinicalText: "",
-          clinicalImage: null,
+          clinicalFiles: [],
         })
       );
 
@@ -111,16 +138,57 @@ export default function Home() {
     setError(null);
 
     try {
-      // Convert clinical images to base64
+      // Convert clinical files to base64
       const patientsData = await Promise.all(
         patients.map(async (patient) => {
-          let clinicalImageBase64: string | undefined;
+          // Process all clinical files for this patient
+          const clinicalFiles: Array<{
+            base64: string;
+            type: "image" | "pdf";
+            filename: string;
+            mimeType: string;
+          }> = [];
 
-          if (patient.clinicalImage) {
-            const buffer = await patient.clinicalImage.arrayBuffer();
+          for (const file of patient.clinicalFiles) {
+            const buffer = await file.arrayBuffer();
             const base64 = Buffer.from(buffer).toString("base64");
-            const mimeType = patient.clinicalImage.type || "image/jpeg";
-            clinicalImageBase64 = `data:${mimeType};base64,${base64}`;
+
+            // Detect PDF more reliably using multiple methods
+            const fileName = file.name.toLowerCase();
+            const declaredMimeType = file.type;
+
+            // Check PDF magic bytes (%PDF) at start of file
+            const uint8Array = new Uint8Array(buffer);
+            const isPdfByMagicBytes =
+              uint8Array.length >= 4 &&
+              uint8Array[0] === 0x25 && // %
+              uint8Array[1] === 0x50 && // P
+              uint8Array[2] === 0x44 && // D
+              uint8Array[3] === 0x46;   // F
+
+            // Determine if file is PDF using magic bytes, extension, or MIME type
+            const isPdf =
+              isPdfByMagicBytes ||
+              fileName.endsWith(".pdf") ||
+              declaredMimeType === "application/pdf";
+
+            if (isPdf) {
+              clinicalFiles.push({
+                base64,
+                type: "pdf",
+                filename: file.name,
+                mimeType: "application/pdf",
+              });
+            } else {
+              // For images, use declared MIME type or default to jpeg
+              const mimeType = declaredMimeType || "image/jpeg";
+              clinicalFiles.push({
+                base64,
+                type: "image",
+                filename: file.name,
+                mimeType,
+              });
+            }
           }
 
           return {
@@ -134,7 +202,7 @@ export default function Home() {
               hospital: patient.hospital,
             },
             clinicalText: patient.clinicalText,
-            clinicalImageBase64,
+            clinicalFiles: clinicalFiles.length > 0 ? clinicalFiles : undefined,
           };
         })
       );
@@ -190,10 +258,11 @@ export default function Home() {
         .filter((r) => r.status === "success")
         .map((r) => {
           try {
-            const parsedReport = JSON.parse(r.jsonString);
+            const parsedData = JSON.parse(r.jsonString);
             return {
               patientId: r.patientId,
-              report: parsedReport,
+              report: parsedData.medicalReport,
+              ftfFormData: parsedData.ftfFormData,
             };
           } catch {
             return null;
@@ -245,10 +314,33 @@ export default function Home() {
     );
   };
 
-  // Update patient clinical image
-  const updateClinicalImage = (patientId: string, file: File | null) => {
+  // Update patient clinical files (supports multiple images and PDFs)
+  const updateClinicalFiles = (patientId: string, files: File[]) => {
+    // Validate each file
+    for (const file of files) {
+      const validation = validateClinicalFile(file);
+      if (!validation.valid) {
+        setError(validation.error || "Invalid file");
+        return;
+      }
+    }
+
+    // Check total size of all files (max 30MB combined)
+    const totalSize = files.reduce((sum, file) => sum + file.size, 0);
+    if (totalSize > MAX_FILE_SIZE) {
+      setError(`Total file size exceeds ${MAX_FILE_SIZE / (1024 * 1024)}MB limit.`);
+      return;
+    }
+
+    // Limit to 10 files per patient
+    if (files.length > 10) {
+      setError("Maximum 10 files per patient.");
+      return;
+    }
+
+    setError(null);
     setPatients((prev) =>
-      prev.map((p) => (p.id === patientId ? { ...p, clinicalImage: file } : p))
+      prev.map((p) => (p.id === patientId ? { ...p, clinicalFiles: files } : p))
     );
   };
 
@@ -417,14 +509,31 @@ export default function Home() {
 
                   <div>
                     <label className="block text-sm font-medium text-black mb-1">
-                      Clinical Image (Optional)
+                      Clinical Images or PDFs (Optional)
                     </label>
                     <input
                       type="file"
-                      accept="image/*"
-                      onChange={(e) => updateClinicalImage(patient.id, e.target.files?.[0] || null)}
+                      multiple
+                      accept="image/*,application/pdf"
+                      onChange={(e) => updateClinicalFiles(patient.id, Array.from(e.target.files || []))}
                       className="block w-full text-sm text-black border border-gray-300 rounded-lg cursor-pointer bg-gray-50"
                     />
+                    {patient.clinicalFiles.length > 0 && (
+                      <div className="mt-2 text-sm text-green-600">
+                        <p>Selected {patient.clinicalFiles.length} file(s):</p>
+                        <ul className="list-disc list-inside ml-2">
+                          {patient.clinicalFiles.map((file, idx) => (
+                            <li key={idx}>
+                              {file.name}
+                              {file.type === 'application/pdf' ? ' (PDF)' : ' (Image)'}
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                    <div className="mt-1 text-xs text-gray-500">
+                      Accepted formats: JPEG, PNG, GIF, WebP images or PDF documents (max 30MB total, 10 files max)
+                    </div>
                   </div>
                 </div>
               ))}
@@ -534,7 +643,7 @@ export default function Home() {
               Step 4: Documents Generation Complete
             </h2>
             <p className="text-black mb-6">
-              {pdfResults.filter((r) => r.status === "success").length} of {pdfResults.length} document sets created successfully.
+              {pdfResults.filter((r) => r.status === "success").length} of {pdfResults.length} document sets created successfully (PDF, DOCX, and FTF Form per patient).
             </p>
 
             <div className="space-y-3 max-h-[400px] overflow-y-auto">
@@ -557,6 +666,11 @@ export default function Home() {
                           {result.docxFilename && (
                             <p className="text-sm text-black">
                               <span className="font-medium">DOCX:</span> {result.docxFilename}
+                            </p>
+                          )}
+                          {result.ftfPdfFilename && (
+                            <p className="text-sm text-black">
+                              <span className="font-medium">FTF Form:</span> {result.ftfPdfFilename}
                             </p>
                           )}
                           <p className="text-sm text-black mt-1 text-xs text-gray-500">
